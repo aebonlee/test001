@@ -1,0 +1,404 @@
+import re
+import time
+import logging
+import requests
+import httpx
+from typing import List, Dict, Any, Optional, Tuple
+from unittest.mock import MagicMock
+
+# --- Constants and Globals ---
+
+# Placeholder for the base URL for raw GitHub content.
+# You should replace this with the correct URL for your repository.
+# e.g., "https://raw.githubusercontent.com/hashicorp/terraform-provider-aws/main/website/docs"
+GITHUB_RAW_BASE_URL = "https://raw.githubusercontent.com/user/repo/main"
+
+# Placeholder for the GraphQL query for GitHub repository search.
+GITHUB_GRAPHQL_QUERY = """
+query($query: String!, $numResults: Int!) {
+  search(query: $query, type: REPOSITORY, first: $numResults) {
+    edges {
+      node {
+        ... on Repository {
+          nameWithOwner
+          url
+          description
+          owner {
+            login
+          }
+          stargazerCount
+          updatedAt
+          primaryLanguage {
+            name
+          }
+          repositoryTopics(first: 10) {
+            nodes {
+              topic {
+                name
+              }
+            }
+          }
+          licenseInfo {
+            name
+          }
+          openIssues: issues(states: OPEN) {
+            totalCount
+          }
+          forkCount
+          homepageUrl
+        }
+      }
+    }
+  }
+}
+"""
+
+_GITHUB_DOC_CACHE = {}
+logger = logging.getLogger(__name__)
+
+# --- Models ---
+
+class GitHubDeps:
+    client: httpx.AsyncClient
+    github_token: str | None = None
+
+# --- GitHub API Functions ---
+
+def github_graphql_request(
+    query: str, variables: Dict[str, Any], token: Optional[str] = None
+) -> Dict[str, Any]:
+    """Make a request to the GitHub GraphQL API with exponential backoff for rate limiting."""
+    headers = {
+        'Content-Type': 'application/json',
+    }
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    try:
+        response = requests.post(
+            'https://api.github.com/graphql',
+            headers=headers,
+            json={'query': query, 'variables': variables},
+            timeout=10,
+        )
+        if response.status_code == 403 and 'rate limit' in response.text.lower():
+            if not token:
+                logger.warning(
+                    'Rate limited by GitHub API and no token provided. Consider adding a GITHUB_TOKEN.'
+                )
+                return {'data': {'search': {'edges': []}}}
+            reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+            current_time = int(time.time())
+            wait_time = min(max(reset_time - current_time, 0), 60)
+            if wait_time > 0:
+                logger.warning(f'Rate limited by GitHub API. Waiting {wait_time} seconds.')
+                time.sleep(wait_time)
+                return github_graphql_request(query, variables, token)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f'GitHub API request error: {str(e)}')
+        raise
+
+def github_repo_search_graphql(
+    keywords: List[str],
+    organizations: List[str],
+    num_results: int = 5,
+    token: Optional[str] = None,
+    license_filter: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Search GitHub repositories using the GraphQL API."""
+    org_filters = ' '.join([f'org:{org}' for org in organizations])
+    keyword_string = ' OR '.join(keywords)
+    query_string = f'{keyword_string} {org_filters}'
+    logger.info(f'Searching GitHub with GraphQL query: {query_string}')
+    try:
+        variables = {
+            'query': query_string,
+            'numResults': num_results * 2,
+        }
+        response = github_graphql_request(GITHUB_GRAPHQL_QUERY, variables, token)
+        if 'errors' in response:
+            error_messages = [
+                error.get('message', 'Unknown error') for error in response['errors']
+            ]
+            logger.error(f'GitHub GraphQL API errors: {", ".join(error_messages)}')
+            return []
+        search_data = response.get('data', {}).get('search', {})
+        edges = search_data.get('edges', [])
+        repo_results = []
+        processed_urls = set()
+        for edge in edges:
+            node = edge.get('node', {})
+            repo_url = node.get('url', '')
+            name_with_owner = node.get('nameWithOwner', '')
+            description = node.get('description', '')
+            owner = node.get('owner', {}).get('login', '')
+            if repo_url in processed_urls or owner.lower() not in [
+                org.lower() for org in organizations
+            ]: # noqa: E501
+                continue
+            processed_urls.add(repo_url)
+            primary_language = node.get('primaryLanguage', {})
+            language = primary_language.get('name') if primary_language else None
+            topics_data = node.get('repositoryTopics', {}).get('nodes', [])
+            topics = [
+                topic.get('topic', {}).get('name') for topic in topics_data if topic.get('topic')
+            ]
+            license_info = node.get('licenseInfo', {})
+            license_name = license_info.get('name') if license_info else None
+            if license_filter and license_name and license_name not in license_filter:
+                continue
+            open_issues = node.get('openIssues', {}).get('totalCount', 0)
+            repo_results.append(
+                {
+                    'url': repo_url,
+                    'title': name_with_owner,
+                    'description': description,
+                    'organization': owner,
+                    'stars': node.get('stargazerCount', 0),
+                    'updated_at': node.get('updatedAt', ''),
+                    'language': language,
+                    'topics': topics,
+                    'license': license_name,
+                    'forks': node.get('forkCount', 0),
+                    'open_issues': open_issues,
+                    'homepage': node.get('homepageUrl'),
+                }
+            )
+            if len(repo_results) >= num_results:
+                break
+        logger.info(f'Found {len(repo_results)} GitHub repositories via GraphQL API')
+        return repo_results
+    except Exception as e:
+        logger.error(f'GitHub GraphQL search error: {str(e)}')
+        return []
+
+
+def github_repo_search_rest(
+    keywords: List[str],
+    organizations: List[str],
+    num_results: int = 5,
+    license_filter: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Search GitHub repositories using the REST API."""
+    repo_results = []
+    processed_urls = set()
+    for org in organizations:
+        try:
+            keyword_string = '+OR+'.join(keywords)
+            query_string = f'{keyword_string}+org:{org}'
+            logger.info(f'Searching GitHub REST API for org {org}')
+            response = requests.get(
+                f'https://api.github.com/search/repositories?q={query_string}&sort=stars&order=desc&per_page={num_results}',
+                headers={'Accept': 'application/vnd.github.v3+json'},
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+            items = data.get('items', [])
+            for item in items:
+                repo_url = item.get('html_url', '')
+                if repo_url in processed_urls:
+                    continue
+                processed_urls.add(repo_url)
+                license_info = item.get('license')
+                license_name = license_info.get('name') if license_info else None
+                if license_filter and license_name and license_name not in license_filter:
+                    continue
+                topics = item.get('topics', [])
+                repo_results.append(
+                    {
+                        'url': repo_url,
+                        'title': item.get('full_name', ''),
+                        'description': item.get('description', ''),
+                        'organization': org,
+                        'stars': item.get('stargazers_count', 0),
+                        'updated_at': item.get('updated_at', ''),
+                        'language': item.get('language'),
+                        'topics': topics,
+                        'license': license_name,
+                        'forks': item.get('forks_count', 0),
+                        'open_issues': item.get('open_issues_count', 0),
+                        'homepage': item.get('homepage'),
+                    }
+                )
+                if len(repo_results) >= num_results:
+                    break
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f'GitHub REST API error for org {org}: {str(e)}')
+            continue
+    logger.info(f'Found {len(repo_results)} GitHub repositories via REST API')
+    return repo_results
+
+# --- Documentation Fetching ---
+
+def resource_to_github_path(
+    asset_name: str, asset_type: str = 'resource', correlation_id: str = ''
+) -> Tuple[str, str]:
+    """Convert AWS resource type to GitHub documentation file path."""
+    if not isinstance(asset_name, str) or not asset_name:
+        logger.error(f'[{correlation_id}] Invalid asset_name: {asset_name}')
+        raise ValueError('asset_name must be a non-empty string')
+
+    valid_asset_types = ['resource', 'data_source', 'both']
+    if asset_type not in valid_asset_types:
+        logger.error(f'[{correlation_id}] Invalid asset_type: {asset_type}')
+        raise ValueError(f'asset_type must be one of {valid_asset_types}')
+
+    if asset_name.startswith('awscc_'):
+        sanitized_name = asset_name
+        if not re.match(r'^[a-zA-Z0-9_-]+$', sanitized_name.replace('awscc_', '')):
+            logger.error(f'[{correlation_id}] Invalid characters in asset_name: {asset_name}')
+            raise ValueError('asset_name contains invalid characters')
+        resource_name = sanitized_name[6:]
+        logger.trace(f"[{correlation_id}] Removed 'awscc_' prefix: {resource_name}")
+        if asset_type == 'data_source':
+            doc_type = 'data-sources'
+        else:
+            doc_type = 'resources'
+        file_path = f'{doc_type}/{resource_name}.md'
+    elif asset_name.startswith('aws_'):
+        sanitized_name = asset_name
+        if not re.match(r'^[a-zA-Z0-9_-]+$', sanitized_name.replace('aws_', '')):
+            logger.error(f'[{correlation_id}] Invalid characters in asset_name: {asset_name}')
+            raise ValueError('asset_name contains invalid characters')
+        resource_name = sanitized_name[4:]
+        logger.trace(f"[{correlation_id}] Removed 'aws_' prefix: {resource_name}")
+        if asset_type == 'data_source':
+            doc_type = 'd'
+        else:
+            doc_type = 'r'
+        file_path = f'{doc_type}/{resource_name}.html.markdown'
+    else:
+        raise ValueError("asset_name must start with 'aws_' or 'awscc_'")
+
+    logger.trace(f'[{correlation_id}] Constructed GitHub file path: {file_path}')
+    github_url = f'{GITHUB_RAW_BASE_URL}/{file_path}'
+    logger.trace(f'[{correlation_id}] GitHub raw URL: {github_url}')
+    return file_path, github_url
+
+
+def fetch_github_documentation(
+    asset_name: str, asset_type: str, cache_enabled: bool, correlation_id: str = ''
+) -> Optional[Dict[str, Any]]:
+    """Fetch documentation from GitHub for a specific resource type."""
+    start_time = time.time()
+    logger.info(f"[{correlation_id}] Fetching documentation from GitHub for '{asset_name}'")
+    cache_key = f'{asset_name}_{asset_type}'
+    if cache_enabled:
+        if cache_key in _GITHUB_DOC_CACHE:
+            logger.info(
+                f"[{correlation_id}] Using cached documentation for '{asset_name}' (asset_type: {asset_type})"
+            )
+            return _GITHUB_DOC_CACHE[cache_key]
+    try:
+        try:
+            _, github_url = resource_to_github_path(asset_name, asset_type, correlation_id)
+        except ValueError as e:
+            logger.error(f'[{correlation_id}] Invalid input parameters: {str(e)}')
+            return None
+        if not github_url.startswith(GITHUB_RAW_BASE_URL):
+            logger.error(f'[{correlation_id}] Invalid GitHub URL constructed: {github_url}')
+            return None
+        logger.info(f'[{correlation_id}] Fetching from GitHub: {github_url}')
+        response = requests.get(github_url, timeout=10)
+        if response.status_code != 200:
+            logger.warning(
+                f'[{correlation_id}] GitHub request failed: HTTP {response.status_code}'
+            )
+            return None
+        markdown_content = response.text
+        content_length = len(markdown_content)
+        logger.debug(f'[{correlation_id}] Received markdown content: {content_length} bytes')
+        if content_length > 0:
+            preview_length = min(200, content_length)
+            logger.trace(
+                f'[{correlation_id}] Markdown preview: {markdown_content[:preview_length]}...'
+            )
+        
+        # The user did not provide the parse_markdown_documentation function.
+        # I will return the raw content for now.
+        # result = parse_markdown_documentation(
+        #     markdown_content, asset_name, github_url, correlation_id
+        # )
+        result = {"content": markdown_content, "url": github_url}
+
+        if cache_enabled:
+            _GITHUB_DOC_CACHE[cache_key] = result
+        fetch_time = time.time() - start_time
+        logger.info(f'[{correlation_id}] GitHub documentation fetched in {fetch_time:.2f} seconds')
+        return result
+    except requests.exceptions.Timeout as e:
+        logger.warning(f'[{correlation_id}] Timeout error fetching from GitHub: {str(e)}')
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f'[{correlation_id}] Request error fetching from GitHub: {str(e)}')
+        return None
+    except Exception as e:
+        logger.error(
+            f'[{correlation_id}] Unexpected error fetching from GitHub: {type(e).__name__}: {str(e)}'
+        )
+        return None
+
+# --- Utility Functions ---
+
+def clean_github_url(url: str) -> str:
+    """Clean GitHub URLs to get the base repository URL."""
+    if 'github.com' in url:
+        parts = url.split('/')
+        if len(parts) > 4:
+            return '/'.join(parts[:5])
+    return url
+
+# --- Mocks ---
+
+def mock_github_release():
+    """Create mock GitHub release data."""
+    return {
+        'tag_name': 'v3.14.0',
+        'published_at': '2023-02-01T00:00:00Z',
+        'name': 'Release 3.14.0',
+        'body': """## What's Changed
+* Feature: Added support for IPv6
+* Bug fix: Fixed subnet creation""",
+    }
+
+def mock_bedrock_agent_client():
+    """Create a mock Bedrock Agent client."""
+    client = MagicMock()
+    kb_paginator = MagicMock()
+    kb_paginator.paginate.return_value = [
+        {
+            'knowledgeBaseSummaries': [
+                {'knowledgeBaseId': 'kb-12345', 'name': 'Test Knowledge Base'},
+                {'knowledgeBaseId': 'kb-67890', 'name': 'Another Knowledge Base'},
+                {'knowledgeBaseId': 'kb-95008', 'name': 'Yet another Knowledge Base'},
+            ]
+        }
+    ]
+    ds_paginator = MagicMock()
+    ds_paginator.paginate.return_value = [
+        {
+            'dataSourceSummaries': [
+                {'dataSourceId': 'ds-12345', 'name': 'Test Data Source'},
+                {'dataSourceId': 'ds-67890', 'name': 'Another Data Source'},
+            ]
+        }
+    ]
+    client.get_knowledge_base.side_effect = lambda knowledgeBaseId: {
+        'knowledgeBase': {
+            'knowledgeBaseArn': f'arn:aws:bedrock:us-west-2:123456789012:knowledge-base/{knowledgeBaseId}'
+        }
+    }
+    def list_tags_for_resource_side_effect(resourceArn: str):
+        kb_id = resourceArn.split('/')[-1]
+        if kb_id == 'kb-95008':
+            return {'tags': {'custom-tag': 'true'}}
+        return {'tags': {'mcp-multirag-kb': 'true'}}
+    client.list_tags_for_resource.side_effect = list_tags_for_resource_side_effect
+    client.get_paginator.side_effect = lambda operation_name: {
+        'list_knowledge_bases': kb_paginator,
+        'list_data_sources': ds_paginator,
+    }[operation_name]
+    return client
